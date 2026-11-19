@@ -1,0 +1,2 @@
+{"id": "q1", "question": "What is retrieval-augmented generation?", "expected_keywords": ["retrieval", "generation"]}
+{"id": "q2", "question": "How does LangGraph handle cycles in agent graphs?", "expected_keywords": ["state", "edge"]}
