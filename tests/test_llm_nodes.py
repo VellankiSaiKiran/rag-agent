@@ -15,16 +15,21 @@ from agent.nodes import (
     PLAN,
     REFLECT,
     SEARCH,
+    MAX_EVIDENCE_IN_PROMPT,
+    REFLECT_SCHEMA,
+    append_sources,
+    cited_numbers,
     make_llm_nodes,
     parse_json_object,
+    rank_evidence,
 )
 from agent.state import initial_state
 from agent.trace import node_path
 from tests.fakes import FakeLLM
 
 
-def _evidence(query: str, source: str = "stub://x") -> dict:
-    return {"query": query, "source": source, "content": "c", "score": 0.0}
+def _evidence(query: str, source: str = "stub://x", content: str = "c", score: float = 0.0) -> dict:
+    return {"query": query, "source": source, "content": content, "score": score}
 
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +123,16 @@ def test_reflect_unparseable_stops_research():
     assert out == {"sufficient": True, "pending_queries": [], "trace": out["trace"]}
 
 
+def test_reflect_schema_asks_for_reason_before_verdict():
+    assert list(REFLECT_SCHEMA["properties"])[:2] == ["reason", "sufficient"]
+
+
+def test_reflect_with_reason_field_stops():
+    llm = FakeLLM(reflect='{"reason": "covers it", "sufficient": true, "follow_up_queries": []}')
+    out = make_llm_nodes(llm)[REFLECT]({"question": "q", "evidence": [_evidence("q")]})
+    assert out["sufficient"] is True and out["pending_queries"] == []
+
+
 def test_reflect_non_boolean_sufficient_is_false():
     llm = FakeLLM(reflect='{"sufficient": "yes", "follow_up_queries": ["more"]}')
     out = make_llm_nodes(llm)[REFLECT]({"question": "q", "evidence": []})
@@ -130,13 +145,67 @@ def test_reflect_non_boolean_sufficient_is_false():
 # --------------------------------------------------------------------------- #
 
 
-def test_answer_prompt_numbers_evidence():
-    llm = FakeLLM(answer="  The answer [2].  ")
-    state = {"question": "q", "evidence": [_evidence("q", "stub://a"), _evidence("q", "stub://b")]}
+def test_answer_prompt_numbers_evidence_best_first_and_resolves_citations():
+    llm = FakeLLM(answer="  The answer [1].  ")
+    state = {
+        "question": "q",
+        "evidence": [_evidence("q", "low.md", score=0.1), _evidence("q", "high.md", score=0.9)],
+    }
     out = make_llm_nodes(llm)[ANSWER](state)
-    assert out["answer"] == "The answer [2]."
+    assert out["answer"] == "The answer [1].\n\nSources:\n[1] high.md"
     prompt = llm.calls[0][1][-1].content
-    assert "[1] stub://a" in prompt and "[2] stub://b" in prompt
+    assert "[1] high.md" in prompt and "[2] low.md" in prompt
+
+
+def test_answer_without_citations_is_left_unchanged():
+    llm = FakeLLM(answer="No idea.")
+    out = make_llm_nodes(llm)[ANSWER]({"question": "q", "evidence": [_evidence("q")]})
+    assert out["answer"] == "No idea."
+
+
+def test_answer_system_prompt_demands_citations():
+    llm = FakeLLM()
+    make_llm_nodes(llm)[ANSWER]({"question": "q", "evidence": []})
+    system = llm.calls[0][1][0].content
+    assert "[1]" in system and "cite" in system.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Evidence ranking and citations
+# --------------------------------------------------------------------------- #
+
+
+def test_rank_evidence_dedupes_keeping_best_score_and_sorts():
+    ev = [
+        _evidence("q1", "a.md", "same", 0.2),
+        _evidence("q2", "b.md", "other", 0.5),
+        _evidence("q3", "a.md", "same", 0.7),  # duplicate chunk, better score
+    ]
+    ranked = rank_evidence(ev)
+    assert [(e["source"], e["score"]) for e in ranked] == [("a.md", 0.7), ("b.md", 0.5)]
+
+
+def test_rank_evidence_caps_items():
+    ev = [_evidence("q", f"{i}.md", score=i / 100) for i in range(MAX_EVIDENCE_IN_PROMPT + 5)]
+    assert len(rank_evidence(ev)) == MAX_EVIDENCE_IN_PROMPT
+
+
+@pytest.mark.parametrize(
+    "text, n, expected",
+    [
+        ("A [2]. B [1][2]. C [3].", 3, [2, 1, 3]),
+        ("Out of range [0] [4] [99].", 3, []),
+        ("No citations.", 3, []),
+        ("Mixed [1] and [7].", 2, [1]),
+    ],
+)
+def test_cited_numbers(text, n, expected):
+    assert cited_numbers(text, n) == expected
+
+
+def test_append_sources_lists_only_cited_items_in_order():
+    items = [_evidence("q", s) for s in ("a.md", "b.md", "c.md")]
+    assert append_sources("X [3]. Y [1].", items) == "X [3]. Y [1].\n\nSources:\n[1] a.md\n[3] c.md"
 
 
 # --------------------------------------------------------------------------- #

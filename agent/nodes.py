@@ -40,11 +40,13 @@ PLAN_SCHEMA: dict[str, Any] = {
 }
 REFLECT_SCHEMA: dict[str, Any] = {
     "type": "object",
+    # "reason" comes first so the model explains itself before giving its verdict.
     "properties": {
+        "reason": {"type": "string"},
         "sufficient": {"type": "boolean"},
         "follow_up_queries": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["sufficient", "follow_up_queries"],
+    "required": ["reason", "sufficient", "follow_up_queries"],
 }
 
 PLAN_SYSTEM = (
@@ -53,16 +55,25 @@ PLAN_SYSTEM = (
     'needed to answer it. Respond with JSON: {"queries": ["..."]}.'
 )
 REFLECT_SYSTEM = (
-    "You review research progress. Given a question and the evidence gathered so "
-    "far, decide whether the evidence is sufficient to answer the question well. "
-    f"If not, propose at most {MAX_FOLLOW_UPS} new search queries that would fill "
-    "the gaps; do not repeat queries already run. Respond with JSON: "
-    '{"sufficient": true|false, "follow_up_queries": ["..."]}.'
+    "You decide whether a research assistant should stop searching.\n"
+    "Set sufficient to true when the evidence directly answers the main point of "
+    "the question, even if some details are missing. The answer does not need to be "
+    "exhaustive. Extra searching costs time and rarely helps.\n"
+    "Set sufficient to false only when the evidence does not address the main point, "
+    f"and then give at most {MAX_FOLLOW_UPS} new, specific search queries for the "
+    "missing information. Never repeat a query that was already run.\n"
+    "First write a one-sentence reason, then the verdict. Respond with JSON: "
+    '{"reason": "...", "sufficient": true|false, "follow_up_queries": ["..."]}.'
 )
 ANSWER_SYSTEM = (
     "You are a careful research assistant. Answer the question using only the "
-    "numbered evidence provided. Cite sources inline as [n]. If the evidence does "
-    "not support an answer, say so plainly."
+    "numbered evidence provided.\n"
+    "Rules:\n"
+    "- After every sentence that uses the evidence, cite it with its number in square "
+    "brackets, like [1] or [2][3]. Use only numbers that appear in the evidence list.\n"
+    "- Do not add a sources list or reference section yourself.\n"
+    "- If the evidence does not answer the question, say so plainly.\n"
+    "Example: Ollama runs models locally [1]. Its server listens on port 11434 [2]."
 )
 
 
@@ -105,15 +116,52 @@ def clean_queries(raw: Any, limit: int, exclude: set[str] = frozenset()) -> list
     return out
 
 
-def format_evidence(evidence: list[Evidence]) -> str:
-    """Number the most recent evidence for inclusion in a prompt."""
-    if not evidence:
+def rank_evidence(evidence: list[Evidence]) -> list[Evidence]:
+    """De-duplicate evidence by (source, content) and order it best-first.
+
+    The same chunk is often retrieved by several queries; it should appear once,
+    so each citation number maps to one distinct passage. Ties keep the order in
+    which evidence was found. Capped at MAX_EVIDENCE_IN_PROMPT.
+    """
+    best: dict[tuple[str, str], Evidence] = {}
+    for e in evidence:
+        key = (e["source"], e["content"])
+        if key not in best or e["score"] > best[key]["score"]:
+            best[key] = e
+    ranked = sorted(best.values(), key=lambda e: -e["score"])  # stable sort
+    return ranked[:MAX_EVIDENCE_IN_PROMPT]
+
+
+def format_evidence(items: list[Evidence]) -> str:
+    """Number already-ranked evidence as [1], [2], ... for a prompt."""
+    if not items:
         return "(no evidence gathered)"
-    items = evidence[-MAX_EVIDENCE_IN_PROMPT:]
     return "\n\n".join(
         f"[{i}] {e['source']}\n{e['content'][:MAX_CHARS_PER_EVIDENCE]}"
         for i, e in enumerate(items, start=1)
     )
+
+
+_CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+def cited_numbers(text: str, n_items: int) -> list[int]:
+    """Valid citation numbers in ``text``, in order of first appearance."""
+    seen: list[int] = []
+    for m in _CITATION_RE.finditer(text):
+        n = int(m.group(1))
+        if 1 <= n <= n_items and n not in seen:
+            seen.append(n)
+    return seen
+
+
+def append_sources(answer: str, items: list[Evidence]) -> str:
+    """Add a 'Sources:' list resolving each cited [n] to its file name."""
+    cited = cited_numbers(answer, len(items))
+    if not cited:
+        return answer
+    lines = [f"[{n}] {items[n - 1]['source']}" for n in sorted(cited)]
+    return answer + "\n\nSources:\n" + "\n".join(lines)
 
 
 def _text(message: Any) -> str:
@@ -149,7 +197,7 @@ def make_llm_nodes(llm: ChatModel) -> dict[str, NodeFn]:
         prompt = (
             f"Question: {state.get('question', '')}\n\n"
             f"Queries already run: {json.dumps(sorted(already_run))}\n\n"
-            f"Evidence:\n{format_evidence(evidence)}"
+            f"Evidence:\n{format_evidence(rank_evidence(evidence))}"
         )
         reply = llm.invoke(
             [SystemMessage(REFLECT_SYSTEM), HumanMessage(prompt)], format=REFLECT_SCHEMA
@@ -166,19 +214,20 @@ def make_llm_nodes(llm: ChatModel) -> dict[str, NodeFn]:
 
     @traced(ANSWER)
     def answer(state: ResearchState) -> dict:
+        items = rank_evidence(state.get("evidence", []))
         prompt = (
             f"Question: {state.get('question', '')}\n\n"
-            f"Evidence:\n{format_evidence(state.get('evidence', []))}"
+            f"Evidence:\n{format_evidence(items)}"
         )
         reply = llm.invoke([SystemMessage(ANSWER_SYSTEM), HumanMessage(prompt)])
-        return {"answer": _text(reply).strip()}
+        return {"answer": append_sources(_text(reply).strip(), items)}
 
     return {PLAN: plan, REFLECT: reflect, ANSWER: answer}
 
 
 @traced(SEARCH)
 def search(state: ResearchState) -> dict:
-    """Run every pending query and collect evidence (tools are still stubs)."""
+    """Run every pending query against web_cache/ and collect the top chunks."""
     new_evidence: list[Evidence] = []
     for query in state.get("pending_queries", []):
         for hit in tools.web_search(query, k=2):
@@ -186,8 +235,8 @@ def search(state: ResearchState) -> dict:
                 Evidence(
                     query=query,
                     source=hit["url"],
-                    content=tools.fetch_page(hit["url"]),
-                    score=0.0,
+                    content=hit["content"],
+                    score=hit["score"],
                 )
             )
     return {

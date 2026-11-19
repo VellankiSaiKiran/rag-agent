@@ -73,7 +73,9 @@ def test_happy_path(fake_default_llm):
     assert node_path(result) == [PLAN, SEARCH, REFLECT, ANSWER]
     assert result["iteration"] == 1
     assert result["evidence"]
-    assert result["answer"] == "Fake answer [1]."
+    answer, sources = result["answer"].split("\n\nSources:\n")
+    assert answer == "Fake answer [1]."
+    assert sources.startswith("[1] ") and sources.endswith(".md")
     assert fake_default_llm.kinds() == ["plan", "reflect", "answer"]
 
 
